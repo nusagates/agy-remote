@@ -377,6 +377,19 @@ function executeWithAgyCli(agyCli, task, projectDir, taskSpecFile, promptMessage
 
         let stdoutData = '';
         let stderrData = '';
+        let progressBuffer = '';
+        let progressThrottle = null;
+
+        const sendProgress = async (text) => {
+            if (!text || !text.trim()) return;
+            executionLogs += text;
+            try {
+                await requestHttp(`${serverUrl}/api/agent-tasks/${task.uuid}/progress`, {
+                    method: 'POST',
+                    headers: { 'Authorization': `Bearer ${token}` },
+                }, { log: text });
+            } catch (_) {}
+        };
 
         const args = [
             '-p', promptMessage,
@@ -389,25 +402,91 @@ function executeWithAgyCli(agyCli, task, projectDir, taskSpecFile, promptMessage
             shell: false,
         });
 
+        // 1. Stream stdout langsung ke server (dibatasi 1 detik per kirim)
         child.stdout.on('data', (chunk) => {
             const str = chunk.toString();
             stdoutData += str;
             process.stdout.write(str);
+
+            progressBuffer += str;
+            if (!progressThrottle) {
+                progressThrottle = setTimeout(async () => {
+                    const toSend = progressBuffer;
+                    progressBuffer = '';
+                    progressThrottle = null;
+                    if (toSend.trim()) {
+                        await sendProgress(toSend);
+                    }
+                }, 1200);
+            }
         });
 
         child.stderr.on('data', async (chunk) => {
             const str = chunk.toString();
             stderrData += str;
             process.stderr.write(str);
-            try {
-                await requestHttp(`${serverUrl}/api/agent-tasks/${task.uuid}/progress`, {
-                    method: 'POST',
-                    headers: { 'Authorization': `Bearer ${token}` },
-                }, { log: str.slice(-200) });
-            } catch (_) {}
+            await sendProgress(str.slice(-200));
         });
 
+        // 2. Pantau transcript JSONL dari agy secara realtime (proses berpikir & aksi tool)
+        const cliBrainDir = path.join(os.homedir(), '.gemini', 'antigravity-cli', 'brain');
+        let activeTranscriptFile = null;
+        let lastLineRead = 0;
+
+        const transcriptMonitor = setInterval(async () => {
+            if (!activeTranscriptFile && fs.existsSync(cliBrainDir)) {
+                try {
+                    const dirs = fs.readdirSync(cliBrainDir).map(d => {
+                        const full = path.join(cliBrainDir, d);
+                        return { full, time: fs.statSync(full).mtimeMs };
+                    }).sort((a, b) => b.time - a.time);
+
+                    if (dirs.length > 0) {
+                        const targetLog = path.join(dirs[0].full, '.system_generated', 'logs', 'transcript.jsonl');
+                        if (fs.existsSync(targetLog)) {
+                            activeTranscriptFile = targetLog;
+                            const existingLines = fs.readFileSync(targetLog, 'utf8').trim().split('\n');
+                            lastLineRead = existingLines.length;
+                        }
+                    }
+                } catch (_) {}
+            }
+
+            if (activeTranscriptFile && fs.existsSync(activeTranscriptFile)) {
+                try {
+                    const raw = fs.readFileSync(activeTranscriptFile, 'utf8').trim();
+                    if (raw) {
+                        const all = raw.split('\n');
+                        if (all.length > lastLineRead) {
+                            const newEntries = all.slice(lastLineRead);
+                            lastLineRead = all.length;
+
+                            for (const lineStr of newEntries) {
+                                try {
+                                    const entry = JSON.parse(lineStr);
+                                    if (entry.type === 'PLANNER_RESPONSE' && entry.thinking) {
+                                        const snippet = entry.thinking.trim().slice(0, 300);
+                                        await sendProgress(`[Berpikir] ${snippet}...\n`);
+                                    } else if (entry.type === 'PLANNER_RESPONSE' && Array.isArray(entry.tool_calls) && entry.tool_calls.length) {
+                                        const toolNames = entry.tool_calls.map(tc => {
+                                            const fileArg = tc.args?.Path || tc.args?.AbsolutePath || tc.args?.TargetFile || '';
+                                            return fileArg ? `${tc.name}(${path.basename(fileArg)})` : tc.name;
+                                        }).join(', ');
+                                        await sendProgress(`[Aksi Tool] ${toolNames}\n`);
+                                    } else if (entry.content && typeof entry.content === 'string' && entry.content.trim().length > 0 && entry.source === 'MODEL') {
+                                        const snippet = entry.content.trim().slice(0, 250);
+                                        await sendProgress(`[AI] ${snippet}\n`);
+                                    }
+                                } catch (_) {}
+                            }
+                        }
+                    }
+                } catch (_) {}
+            }
+        }, 1500);
+
         child.on('error', async (err) => {
+            clearInterval(transcriptMonitor);
             console.error(`[Antigravity CLI Error] ${err.message}`);
             executionLogs += `\n[Error] ${err.message}\n`;
             try {
@@ -420,6 +499,11 @@ function executeWithAgyCli(agyCli, task, projectDir, taskSpecFile, promptMessage
         });
 
         child.on('close', async (code) => {
+            clearInterval(transcriptMonitor);
+            if (progressThrottle) clearTimeout(progressThrottle);
+            if (progressBuffer.trim()) {
+                await sendProgress(progressBuffer);
+            }
             console.log(`[Antigravity CLI] Selesai dengan exit code: ${code}`);
             executionLogs += `\n[Antigravity CLI] Selesai dengan kode: ${code}\n`;
 
