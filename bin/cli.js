@@ -824,15 +824,18 @@ async function startListening(config) {
         console.warn(`[Auto-Register Info] ${err.message}`);
     }
 
-    const projectsList = Object.keys(config.projects || { toolbox: 1, auresys: 1 }).join(',');
+    const workerId = config.workerId || `${os.hostname()}`;
+    const workerName = config.workerName || `${os.hostname()} (${os.platform()})`;
+    const platform = os.platform();
 
     console.log('========================================================');
-    console.log('  ToolGates-AGY: Antigravity Remote Coding Worker       ');
+    console.log('  AGY Remote: Antigravity Coding Worker                 ');
     console.log('========================================================');
     console.log(`Server   : ${serverUrl}`);
     console.log(`Projects : ${projectsList}`);
     console.log(`Interval : ${interval}ms`);
-    console.log(`Worker ID: ${os.hostname()}`);
+    console.log(`Worker ID: ${workerId}`);
+    console.log(`Mesin    : ${workerName}`);
     console.log('\nMenunggu tugas baru dari ToolBox web... (Tekan Ctrl+C untuk berhenti)\n');
 
     let isBusy = false;
@@ -841,9 +844,14 @@ async function startListening(config) {
         if (isBusy) return;
 
         try {
-            const url = `${serverUrl}/api/agent-tasks/poll?projects=${encodeURIComponent(projectsList)}`;
+            const url = `${serverUrl}/api/agent-tasks/poll?projects=${encodeURIComponent(projectsList)}&worker_id=${encodeURIComponent(workerId)}&worker_name=${encodeURIComponent(workerName)}&platform=${encodeURIComponent(platform)}`;
             const res = await requestHttp(url, {
-                headers: { 'Authorization': `Bearer ${token}` },
+                headers: { 
+                    'Authorization': `Bearer ${token}`,
+                    'X-Worker-Id': workerId,
+                    'X-Worker-Name': workerName,
+                    'X-Worker-Platform': platform,
+                },
             });
 
             if (res && res.task) {
@@ -879,6 +887,8 @@ async function main() {
     }
     if (parsed.params.token) config.token = parsed.params.token;
     if (parsed.params.interval) config.pollInterval = parseInt(parsed.params.interval, 10);
+    if (parsed.params['worker-id']) config.workerId = String(parsed.params['worker-id']);
+    if (parsed.params['worker-name']) config.workerName = String(parsed.params['worker-name']);
     
     // --once should only apply per invocation, never persisted
     const runOnce = !!parsed.params.once;
