@@ -736,9 +736,14 @@ function setupProjectAndPermissions(cwd, config) {
             fs.mkdirSync(projectsDir, { recursive: true });
         }
 
-        const driveLetter = resolvedPath.charAt(0).toLowerCase();
-        const subPath = resolvedPath.slice(2).replace(/\\/g, '/');
-        const folderUri = `file:///${driveLetter}%3A${subPath}`;
+        let folderUri;
+        if (os.platform() === 'win32') {
+            const driveLetter = resolvedPath.charAt(0).toLowerCase();
+            const subPath = resolvedPath.slice(2).replace(/\\/g, '/');
+            folderUri = `file:///${driveLetter}%3A${subPath}`;
+        } else {
+            folderUri = `file://${resolvedPath}`;
+        }
 
         const existingFiles = fs.readdirSync(projectsDir).filter(f => f.endsWith('.json'));
         let alreadyConfigured = false;
@@ -824,6 +829,7 @@ async function startListening(config) {
         console.warn(`[Auto-Register Info] ${err.message}`);
     }
 
+    const projectsList = Object.keys(config.projects || {}).join(',') || currentProj.projectKey;
     const workerId = config.workerId || `${os.hostname()}`;
     const workerName = config.workerName || `${os.hostname()} (${os.platform()})`;
     const platform = os.platform();
