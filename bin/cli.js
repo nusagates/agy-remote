@@ -847,10 +847,22 @@ async function startListening(config) {
     let isBusy = false;
 
     const poll = async () => {
-        if (isBusy) return;
-
         try {
             const url = `${serverUrl}/api/agent-tasks/poll?projects=${encodeURIComponent(projectsList)}&worker_id=${encodeURIComponent(workerId)}&worker_name=${encodeURIComponent(workerName)}&platform=${encodeURIComponent(platform)}`;
+
+            if (isBusy) {
+                // Keep sending heartbeat while busy so server knows worker is alive
+                await requestHttp(`${url}&busy=1`, {
+                    headers: { 
+                        'Authorization': `Bearer ${token}`,
+                        'X-Worker-Id': workerId,
+                        'X-Worker-Name': workerName,
+                        'X-Worker-Platform': platform,
+                    },
+                }).catch(() => {});
+                return;
+            }
+
             const res = await requestHttp(url, {
                 headers: { 
                     'Authorization': `Bearer ${token}`,
