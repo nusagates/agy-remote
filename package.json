@@ -1,8 +1,9 @@
 {
-  "name": "nusagates-agy",
+  "name": "agy-remote",
   "version": "1.0.0",
   "description": "ToolBox Remote Coding Task Dispatcher & Worker for Google Antigravity",
   "bin": {
+    "agy-remote": "./bin/cli.js",
     "nusagates-agy": "./bin/cli.js",
     "toolgates-agy": "./bin/cli.js"
   },

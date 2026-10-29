@@ -1,4 +1,4 @@
-# NusaGates AGY (nusagates-agy)
+# AGY Remote (agy-remote)
 
 > Remote Coding Task Dispatcher & Worker for **Google Antigravity** (IDE & CLI).  
 > Hubungkan dashboard web ToolBox dengan Antigravity di PC Lokal atau VPS Linux.
@@ -21,14 +21,14 @@
 ### 1. Menjalankan Langsung via NPX (Tanpa Install)
 
 ```bash
-npx github:nusagates/nusagates-agy listen --server=https://tools.nusagates.com --token=YOUR_AGENT_TOKEN
+npx github:nusagates/agy-remote listen --server=https://tools.nusagates.com --token=YOUR_AGENT_TOKEN
 ```
 
 ### 2. Atau Install Global di Sistem
 
 ```bash
-npm install -g github:nusagates/nusagates-agy
-nusagates-agy listen --server=https://tools.nusagates.com --token=YOUR_AGENT_TOKEN
+npm install -g github:nusagates/agy-remote
+agy-remote listen --server=https://tools.nusagates.com --token=YOUR_AGENT_TOKEN
 ```
 
 ---
@@ -43,7 +43,7 @@ nusagates-agy listen --server=https://tools.nusagates.com --token=YOUR_AGENT_TOK
    ```
 2. Jalankan worker di background via PM2:
    ```bash
-   pm2 start npx --name "nusagates-worker" -- github:nusagates/nusagates-agy listen --server=https://tools.nusagates.com --token=YOUR_AGENT_TOKEN
+   pm2 start npx --name "agy-remote-worker" -- github:nusagates/agy-remote listen --server=https://tools.nusagates.com --token=YOUR_AGENT_TOKEN
    ```
 
 ---
