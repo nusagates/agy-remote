@@ -1,0 +1,22 @@
+{
+  "name": "nusagates-agy",
+  "version": "1.0.0",
+  "description": "ToolBox Remote Coding Task Dispatcher & Worker for Google Antigravity",
+  "bin": {
+    "nusagates-agy": "./bin/cli.js",
+    "toolgates-agy": "./bin/cli.js"
+  },
+  "main": "./bin/cli.js",
+  "type": "commonjs",
+  "scripts": {
+    "listen": "node bin/cli.js listen"
+  },
+  "keywords": [
+    "antigravity",
+    "toolbox",
+    "task-runner",
+    "remote-coding"
+  ],
+  "author": "NusaGates",
+  "license": "MIT"
+}
