@@ -379,6 +379,7 @@ function executeWithAgyCli(agyCli, task, projectDir, taskSpecFile, promptMessage
         let stderrData = '';
         let progressBuffer = '';
         let progressThrottle = null;
+        const taskStartTime = Date.now();
 
         const sendProgress = async (text) => {
             if (!text || !text.trim()) return;
@@ -436,17 +437,27 @@ function executeWithAgyCli(agyCli, task, projectDir, taskSpecFile, promptMessage
         const transcriptMonitor = setInterval(async () => {
             if (!activeTranscriptFile && fs.existsSync(cliBrainDir)) {
                 try {
-                    const dirs = fs.readdirSync(cliBrainDir).map(d => {
+                    const entries = fs.readdirSync(cliBrainDir);
+                    const candidates = [];
+                    for (const d of entries) {
                         const full = path.join(cliBrainDir, d);
-                        return { full, time: fs.statSync(full).mtimeMs };
-                    }).sort((a, b) => b.time - a.time);
+                        try {
+                            const stat = fs.statSync(full);
+                            const t = Math.max(stat.mtimeMs, stat.birthtimeMs || 0);
+                            // Saring folder yang lahir/diubah setelah tugas ini mulai berjalan
+                            if (stat.isDirectory() && t >= (taskStartTime - 3000)) {
+                                candidates.push({ full, time: t });
+                            }
+                        } catch (_) {}
+                    }
 
-                    if (dirs.length > 0) {
-                        const targetLog = path.join(dirs[0].full, '.system_generated', 'logs', 'transcript.jsonl');
+                    candidates.sort((a, b) => b.time - a.time);
+
+                    if (candidates.length > 0) {
+                        const targetLog = path.join(candidates[0].full, '.system_generated', 'logs', 'transcript.jsonl');
                         if (fs.existsSync(targetLog)) {
                             activeTranscriptFile = targetLog;
-                            const existingLines = fs.readFileSync(targetLog, 'utf8').trim().split('\n');
-                            lastLineRead = existingLines.length;
+                            lastLineRead = 0; // Baca dari awal untuk tugas baru ini
                         }
                     }
                 } catch (_) {}
@@ -462,17 +473,28 @@ function executeWithAgyCli(agyCli, task, projectDir, taskSpecFile, promptMessage
                             lastLineRead = all.length;
 
                             for (const lineStr of newEntries) {
+                                if (!lineStr || !lineStr.trim()) continue;
                                 try {
                                     const entry = JSON.parse(lineStr);
-                                    if (entry.type === 'PLANNER_RESPONSE' && entry.thinking) {
-                                        const snippet = entry.thinking.trim().slice(0, 300);
-                                        await sendProgress(`[Berpikir] ${snippet}...\n`);
-                                    } else if (entry.type === 'PLANNER_RESPONSE' && Array.isArray(entry.tool_calls) && entry.tool_calls.length) {
-                                        const toolNames = entry.tool_calls.map(tc => {
-                                            const fileArg = tc.args?.Path || tc.args?.AbsolutePath || tc.args?.TargetFile || '';
-                                            return fileArg ? `${tc.name}(${path.basename(fileArg)})` : tc.name;
-                                        }).join(', ');
-                                        await sendProgress(`[Aksi Tool] ${toolNames}\n`);
+                                    if (entry.type === 'PLANNER_RESPONSE') {
+                                        if (entry.thinking) {
+                                            const snippet = entry.thinking.trim().slice(0, 300);
+                                            await sendProgress(`[Berpikir] ${snippet}...\n`);
+                                        }
+                                        if (Array.isArray(entry.tool_calls) && entry.tool_calls.length) {
+                                            const toolNames = entry.tool_calls.map(tc => {
+                                                const rawArg = tc.args?.Path || tc.args?.AbsolutePath || tc.args?.TargetFile || tc.args?.toolSummary || tc.args?.CommandLine || '';
+                                                const cleanArg = String(rawArg).replace(/^["']|["']$/g, '').trim();
+                                                if (cleanArg) {
+                                                    const short = (tc.name === 'run_command' || tc.args?.toolSummary)
+                                                        ? (cleanArg.length > 40 ? cleanArg.slice(0, 40) + '...' : cleanArg)
+                                                        : path.basename(cleanArg);
+                                                    return `${tc.name}(${short})`;
+                                                }
+                                                return tc.name;
+                                            }).join(', ');
+                                            await sendProgress(`[Aksi Tool] ${toolNames}\n`);
+                                        }
                                     } else if (entry.content && typeof entry.content === 'string' && entry.content.trim().length > 0 && entry.source === 'MODEL') {
                                         const snippet = entry.content.trim().slice(0, 250);
                                         await sendProgress(`[AI] ${snippet}\n`);
@@ -483,7 +505,7 @@ function executeWithAgyCli(agyCli, task, projectDir, taskSpecFile, promptMessage
                     }
                 } catch (_) {}
             }
-        }, 1500);
+        }, 1200);
 
         child.on('error', async (err) => {
             clearInterval(transcriptMonitor);
