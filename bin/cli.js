@@ -43,10 +43,7 @@ function loadConfig() {
         server: 'https://tools.nusagates.com',
         token: '',
         pollInterval: 5000,
-        projects: {
-            toolbox: 'C:\\laragon\\www\\toolbox',
-            auresys: 'C:\\laragon\\www\\auresys',
-        },
+        projects: {},
     };
 }
 
@@ -139,29 +136,84 @@ function requestHttp(urlStr, options = {}, postData = null) {
     });
 }
 
-// Resolve directory for a project key
-function resolveProjectDir(projectKey, config) {
-    if (config.projects && config.projects[projectKey]) {
-        const customPath = config.projects[projectKey];
-        if (fs.existsSync(customPath)) {
-            return customPath;
+// Safe directory resolver for a project key
+function resolveProjectDir(projectKey, config, serverLocalPath = null) {
+    if (!projectKey) return null;
+
+    const normKey = projectKey.toLowerCase().replace(/[^a-z0-9_-]/g, '-');
+
+    // 1. Prefer server-configured local_path if it exists on this machine
+    if (serverLocalPath && fs.existsSync(serverLocalPath)) {
+        return serverLocalPath;
+    }
+
+    // 2. Local config mapping (e.g. config.projects[projectKey])
+    if (config.projects) {
+        if (config.projects[projectKey] && fs.existsSync(config.projects[projectKey])) {
+            return config.projects[projectKey];
+        }
+        if (config.projects[normKey] && fs.existsSync(config.projects[normKey])) {
+            return config.projects[normKey];
         }
     }
 
-    // Default Laragon check: C:\laragon\www\<projectKey>
-    const laragonPath = path.join('C:\\laragon\\www', projectKey);
-    if (fs.existsSync(laragonPath)) {
-        return laragonPath;
-    }
-
-    // Default Linux VPS check: /var/www/<projectKey>
+    // 3. Default Linux VPS check: /var/www/<projectKey>
     const linuxPath = path.join('/var/www', projectKey);
     if (fs.existsSync(linuxPath)) {
         return linuxPath;
     }
 
-    // Fallback: Current Working Directory
-    return process.cwd();
+    // 4. Default Laragon check: C:\laragon\www\<projectKey>
+    const laragonPath = path.join('C:\\laragon\\www', projectKey);
+    if (fs.existsSync(laragonPath)) {
+        return laragonPath;
+    }
+
+    // 5. Match current working directory only if its folder name matches the project key
+    const cwdBase = path.basename(process.cwd()).toLowerCase().replace(/[^a-z0-9_-]/g, '-');
+    if (cwdBase === normKey) {
+        return process.cwd();
+    }
+
+    // 6. SAFETY: Return null if directory is not found on this machine!
+    // NEVER fallback to an arbitrary process.cwd() of another project!
+    return null;
+}
+
+// Get verified list of project keys that actually exist on this machine
+function getVerifiedSupportedProjects(config, currentProj = null) {
+    const supported = new Set();
+
+    // 1. Current working directory if valid
+    if (currentProj && currentProj.projectKey) {
+        if (fs.existsSync(currentProj.resolvedPath)) {
+            supported.add(currentProj.projectKey);
+        }
+    }
+
+    // 2. Verified paths in config.projects
+    if (config && config.projects && typeof config.projects === 'object') {
+        for (const [key, pDir] of Object.entries(config.projects)) {
+            if (pDir && typeof pDir === 'string' && fs.existsSync(pDir)) {
+                supported.add(key.toLowerCase().replace(/[^a-z0-9_-]/g, '-'));
+            }
+        }
+    }
+
+    // 3. Auto-discover sibling projects in standard base directory (/var/www or C:\laragon\www)
+    try {
+        const standardBase = process.platform === 'win32' ? 'C:\\laragon\\www' : '/var/www';
+        if (fs.existsSync(standardBase)) {
+            const entries = fs.readdirSync(standardBase, { withFileTypes: true });
+            for (const entry of entries) {
+                if (entry.isDirectory() && !entry.name.startsWith('.')) {
+                    supported.add(entry.name.toLowerCase().replace(/[^a-z0-9_-]/g, '-'));
+                }
+            }
+        }
+    } catch (_) {}
+
+    return Array.from(supported);
 }
 
 function getGitStatus(cwd) {
@@ -171,6 +223,29 @@ function getGitStatus(cwd) {
     } catch (_) {
         return [];
     }
+}
+
+function cleanOldTaskSpecs(tasksDir, maxAgeDays = 14) {
+    try {
+        if (!fs.existsSync(tasksDir)) return;
+        const cutoff = Date.now() - (maxAgeDays * 24 * 60 * 60 * 1000);
+        const entries = fs.readdirSync(tasksDir);
+        let removed = 0;
+        for (const file of entries) {
+            if (!file.endsWith('.md')) continue;
+            const fullPath = path.join(tasksDir, file);
+            try {
+                const stat = fs.statSync(fullPath);
+                if (stat.mtimeMs < cutoff) {
+                    fs.unlinkSync(fullPath);
+                    removed++;
+                }
+            } catch (_) {}
+        }
+        if (removed > 0) {
+            console.log(`[Auto-Clean] ${removed} file task spec kadaluarsa (> ${maxAgeDays} hari) berhasil dibersihkan dari ${tasksDir}`);
+        }
+    } catch (_) {}
 }
 
 function getActiveAntigravityConversation() {
@@ -444,7 +519,7 @@ function executeWithAgyCli(agyCli, task, projectDir, taskSpecFile, promptMessage
                         try {
                             const stat = fs.statSync(full);
                             const t = Math.max(stat.mtimeMs, stat.birthtimeMs || 0);
-                            // Saring folder yang lahir/diubah setelah tugas ini mulai berjalan
+                            // Saring folder yang lahir/diubah setelah tugas ini mulai berjalan (buffer 3s)
                             if (stat.isDirectory() && t >= (taskStartTime - 3000)) {
                                 candidates.push({ full, time: t });
                             }
@@ -578,31 +653,67 @@ async function executeTask(task, config, serverLocalPath = null) {
     const token = config.token;
 
     // 1. Mark task as running
+    const activeWorkerId = config.workerId || `${os.hostname()}`;
+    const activeWorkerName = config.workerName || `${os.hostname()} (${os.platform()})`;
+
     try {
-        await requestHttp(`${serverUrl}/api/agent-tasks/${task.uuid}/start`, {
+        const startRes = await requestHttp(`${serverUrl}/api/agent-tasks/${task.uuid}/start`, {
             method: 'POST',
-            headers: { 'Authorization': `Bearer ${token}` },
+            headers: { 
+                'Authorization': `Bearer ${token}`,
+                'X-Worker-Id': activeWorkerId,
+                'X-Worker-Name': activeWorkerName,
+            },
         }, {
-            worker_id: `${os.hostname()} (${os.platform()})`,
+            worker_id: activeWorkerId,
+            worker_name: activeWorkerName,
         });
+
+        if (startRes && startRes.error) {
+            console.warn(`[Task Skipped] ${startRes.error}`);
+            return;
+        }
     } catch (err) {
         console.error(`[Start Error] ${err.message}`);
+        return;
     }
 
-    // 2. Resolve project directory (prefer server configured local_path, then local mapping, then fallback)
-    let projectDir = (serverLocalPath && fs.existsSync(serverLocalPath))
-        ? serverLocalPath
-        : resolveProjectDir(task.project_key, config);
-    console.log(`Project Dir: ${projectDir}`);
+    // 2. Resolve project directory safely
+    const projectDir = resolveProjectDir(task.project_key, config, serverLocalPath);
+    console.log(`Project Dir: ${projectDir || '(TIDAK DITEMUKAN DI MESIN INI)'}`);
 
-    if (!fs.existsSync(projectDir)) {
-        console.error(`Directory not found: ${projectDir}`);
-        await requestHttp(`${serverUrl}/api/agent-tasks/${task.uuid}/fail`, {
-            method: 'POST',
-            headers: { 'Authorization': `Bearer ${token}` },
-        }, {
-            error: `Direktori proyek '${task.project_key}' tidak ditemukan di ${projectDir}.`,
-        });
+    if (!projectDir || !fs.existsSync(projectDir)) {
+        console.error(`\n[PENGAMAN SERVER] Direktori proyek '${task.project_key}' (${serverLocalPath || 'path tidak disetel'}) TIDAK DITEMUKAN di mesin ini (${activeWorkerName} / ${activeWorkerId})!`);
+        console.error(`[PENGAMAN SERVER] Eksekusi DIBATALKAN untuk mencegah modifikasi di folder/server yang salah.`);
+
+        const reason = `Folder proyek '${task.project_key}' (${serverLocalPath || 'path tidak disetel'}) tidak ditemukan di ${activeWorkerName}.`;
+
+        try {
+            // Kembalikan tugas ke antrean server (circuit breaker release) agar dapat diambil oleh server yang benar
+            await requestHttp(`${serverUrl}/api/agent-tasks/${task.uuid}/release`, {
+                method: 'POST',
+                headers: { 
+                    'Authorization': `Bearer ${token}`,
+                    'X-Worker-Id': activeWorkerId,
+                    'X-Worker-Name': activeWorkerName,
+                },
+            }, {
+                worker_id: activeWorkerId,
+                worker_name: activeWorkerName,
+                reason: reason,
+            });
+            console.log(`[PENGAMAN SERVER] Tugas telah berhasil dikembalikan ke antrean server agar dapat dieksekusi mesin yang benar.`);
+        } catch (releaseErr) {
+            console.warn(`[PENGAMAN SERVER] Gagal release ke queue (${releaseErr.message}), mengirim fail status.`);
+            try {
+                await requestHttp(`${serverUrl}/api/agent-tasks/${task.uuid}/fail`, {
+                    method: 'POST',
+                    headers: { 'Authorization': `Bearer ${token}` },
+                }, {
+                    error: `[Pengaman Server] ${reason}`,
+                });
+            } catch (_) {}
+        }
         return;
     }
 
@@ -615,6 +726,7 @@ async function executeTask(task, config, serverLocalPath = null) {
         if (!fs.existsSync(agentsTaskDir)) {
             fs.mkdirSync(agentsTaskDir, { recursive: true });
         }
+        cleanOldTaskSpecs(agentsTaskDir, 14);
     } catch (_) {}
 
     const taskSpecFile = path.join(agentsTaskDir, `task-${task.uuid}.md`);
@@ -895,12 +1007,13 @@ function setupProjectAndPermissions(cwd, config) {
         }
     } catch (_) {}
 
-    // 4. Pastikan folder .agents/tasks ada
+    // 4. Pastikan folder .agents/tasks ada & auto bersihkan berkas lama (> 14 hari)
     try {
         const tasksDir = path.join(resolvedPath, '.agents', 'tasks');
         if (!fs.existsSync(tasksDir)) {
             fs.mkdirSync(tasksDir, { recursive: true });
         }
+        cleanOldTaskSpecs(tasksDir, 14);
     } catch (_) {}
 
     return { projectName, projectKey, resolvedPath };
@@ -918,43 +1031,67 @@ async function startListening(config) {
         process.exit(1);
     }
 
+    const isCustomName = Boolean(config.workerName);
+    const workerId = config.workerId || `${os.hostname()}`;
+    const workerName = config.workerName || `${os.hostname()} (${os.platform()})`;
+    const platform = os.platform();
+
     // Otomatis daftarkan direktori terminal saat ini ke Antigravity & Web ToolBox
     const currentProj = setupProjectAndPermissions(process.cwd(), config);
 
     try {
         await requestHttp(`${serverUrl}/api/agent-tasks/register-project`, {
             method: 'POST',
-            headers: { 'Authorization': `Bearer ${token}` }
+            headers: { 
+                'Authorization': `Bearer ${token}`,
+                'X-Worker-Id': workerId,
+                'X-Worker-Name': workerName,
+            }
         }, {
             name: currentProj.projectName,
             key: currentProj.projectKey,
-            path: currentProj.resolvedPath
+            path: currentProj.resolvedPath,
+            worker_id: workerId,
+            worker_name: workerName,
         });
         console.log(`[Auto-Register] Proyek '${currentProj.projectName}' (${currentProj.projectKey}) aktif dan terdaftar di server.`);
     } catch (err) {
         console.warn(`[Auto-Register Info] ${err.message}`);
     }
 
-    const projectsList = Object.keys(config.projects || {}).join(',') || currentProj.projectKey;
-    const workerId = config.workerId || `${os.hostname()}`;
-    const workerName = config.workerName || `${os.hostname()} (${os.platform()})`;
-    const platform = os.platform();
+    const verifiedProjects = getVerifiedSupportedProjects(config, currentProj);
+    const projectsList = verifiedProjects.join(',');
 
     console.log('========================================================');
     console.log('  AGY Remote: Antigravity Coding Worker                 ');
     console.log('========================================================');
     console.log(`Server   : ${serverUrl}`);
-    console.log(`Projects : ${projectsList}`);
+    console.log(`Projects : ${projectsList || '(Tidak ada - hanya tugas eksplisit)'}`);
     console.log(`Interval : ${interval}ms`);
     console.log(`Worker ID: ${workerId}`);
     console.log(`Mesin    : ${workerName}`);
     console.log('\nMenunggu tugas baru dari ToolBox web... (Tekan Ctrl+C untuk berhenti)\n');
 
     let isBusy = false;
+    let lastCleanCheck = Date.now();
 
     const poll = async () => {
         try {
-            const url = `${serverUrl}/api/agent-tasks/poll?projects=${encodeURIComponent(projectsList)}&worker_id=${encodeURIComponent(workerId)}&worker_name=${encodeURIComponent(workerName)}&platform=${encodeURIComponent(platform)}`;
+            // Auto bersihkan task specs kadaluarsa (> 14 hari) sekali sehari
+            const now = Date.now();
+            if (now - lastCleanCheck > 24 * 60 * 60 * 1000) {
+                lastCleanCheck = now;
+                if (config.projects) {
+                    for (const pDir of Object.values(config.projects)) {
+                        cleanOldTaskSpecs(path.join(pDir, '.agents', 'tasks'), 14);
+                    }
+                }
+            }
+
+            const currentSupported = getVerifiedSupportedProjects(config, currentProj);
+            const currentProjectsParam = currentSupported.join(',');
+            const customParam = isCustomName ? '&custom_name=1' : '';
+            const url = `${serverUrl}/api/agent-tasks/poll?projects=${encodeURIComponent(currentProjectsParam)}&worker_id=${encodeURIComponent(workerId)}&worker_name=${encodeURIComponent(workerName)}&platform=${encodeURIComponent(platform)}${customParam}`;
 
             if (isBusy) {
                 // Keep sending heartbeat while busy so server knows worker is alive
@@ -964,6 +1101,7 @@ async function startListening(config) {
                         'X-Worker-Id': workerId,
                         'X-Worker-Name': workerName,
                         'X-Worker-Platform': platform,
+                        'X-Worker-Custom-Name': isCustomName ? '1' : '0',
                     },
                 }).catch(() => {});
                 return;
@@ -975,6 +1113,7 @@ async function startListening(config) {
                     'X-Worker-Id': workerId,
                     'X-Worker-Name': workerName,
                     'X-Worker-Platform': platform,
+                    'X-Worker-Custom-Name': isCustomName ? '1' : '0',
                 },
             });
 
@@ -1011,15 +1150,19 @@ async function main() {
     }
     if (parsed.params.token) config.token = parsed.params.token;
     if (parsed.params.interval) config.pollInterval = parseInt(parsed.params.interval, 10);
-    if (parsed.params['worker-id']) config.workerId = String(parsed.params['worker-id']);
-    if (parsed.params['worker-name']) config.workerName = String(parsed.params['worker-name']);
+    if (parsed.params['worker-id'] || parsed.params.id) {
+        config.workerId = String(parsed.params['worker-id'] || parsed.params.id).replace(/^["']|["']$/g, '');
+    }
+    if (parsed.params['worker-name'] || parsed.params.name) {
+        config.workerName = String(parsed.params['worker-name'] || parsed.params.name).replace(/^["']|["']$/g, '');
+    }
     
     // --once should only apply per invocation, never persisted
     const runOnce = !!parsed.params.once;
     delete config.once;
 
     // Save updated parameters to persistent config
-    if (parsed.params.server || parsed.params.token) {
+    if (parsed.params.server || parsed.params.token || parsed.params['worker-id'] || parsed.params.id || parsed.params['worker-name'] || parsed.params.name) {
         saveConfig(config);
     }
 
@@ -1064,6 +1207,7 @@ Penggunaan:
 Opsi:
   --server=<url>       URL server ToolBox (contoh: https://toolbox.my.id)
   --token=<token>      Token agen dari halaman Remote Coding ToolBox
+  --name=<nama>        Nama worker / mesin (contoh: VPS-Ubuntu, MacBook-Pro)
   --interval=<ms>      Interval polling dalam milidetik (default: 5000)
   --add-project=key:path  Petakan proyek baru (contoh: auresys:C:\\laragon\\www\\auresys)
 
