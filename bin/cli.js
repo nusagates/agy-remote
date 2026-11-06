@@ -465,21 +465,27 @@ function findTranscriptForTask(brainDir, taskUuid) {
         // Sort newest folders first
         candidates.sort((a, b) => b.time - a.time);
 
-        // Check top 25 candidates
-        for (const cand of candidates.slice(0, 25)) {
-            const targetLog = path.join(cand.full, '.system_generated', 'logs', 'transcript.jsonl');
-            if (fs.existsSync(targetLog)) {
-                try {
-                    // Check if transcript file contains task.uuid in the first 8KB
-                    const fd = fs.openSync(targetLog, 'r');
-                    const buf = Buffer.alloc(8192);
-                    const bytesRead = fs.readSync(fd, buf, 0, 8192, 0);
-                    fs.closeSync(fd);
-                    const head = buf.toString('utf8', 0, bytesRead);
-                    if (head.includes(taskUuid)) {
-                        return targetLog;
-                    }
-                } catch (_) {}
+        // Check top 50 candidates
+        for (const cand of candidates.slice(0, 50)) {
+            const logPaths = [
+                path.join(cand.full, '.system_generated', 'logs', 'transcript.jsonl'),
+                path.join(cand.full, '.system_generated', 'logs', 'chunks', 'transcript', '00000000.jsonl')
+            ];
+            for (const targetLog of logPaths) {
+                if (fs.existsSync(targetLog)) {
+                    try {
+                        // Check if transcript file contains task.uuid in the first 8KB
+                        const fd = fs.openSync(targetLog, 'r');
+                        const buf = Buffer.alloc(8192);
+                        const bytesRead = fs.readSync(fd, buf, 0, 8192, 0);
+                        fs.closeSync(fd);
+                        const head = buf.toString('utf8', 0, bytesRead);
+                        if (head.includes(taskUuid)) {
+                            const mainLog = path.join(cand.full, '.system_generated', 'logs', 'transcript.jsonl');
+                            return fs.existsSync(mainLog) ? mainLog : targetLog;
+                        }
+                    } catch (_) {}
+                }
             }
         }
     } catch (_) {}
@@ -1077,14 +1083,16 @@ function resolveWorkerIdentity(config, params = {}) {
         } else {
             workerName = `${os.hostname()} (${os.platform()})`;
         }
-    } else if (isPm2Numeric && parseInt(pmId, 10) > 0 && !workerName.includes('#')) {
-        // Multi-instance cluster in PM2: append instance index
+    } else if (isPm2Numeric && parseInt(pmId, 10) > 0 && !workerName.includes('#') && !config.workerName) {
+        // Multi-instance cluster in PM2: append instance index only if workerName was not configured explicitly
         workerName = `${workerName} #${parseInt(pmId, 10) + 1}`;
     }
 
     let workerId = '';
     if (cliId) {
         workerId = String(cliId).trim();
+    } else if (config.workerId) {
+        workerId = String(config.workerId).trim();
     } else if (cliName || hasCustomPmAppName) {
         // Explicit new name on CLI or PM2 app name: generate distinct worker ID
         const baseHost = os.hostname();
