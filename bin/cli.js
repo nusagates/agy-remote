@@ -445,6 +445,48 @@ function notifyAntigravityAgent(task, projectDir, taskSpecFile) {
     }
 }
 
+function findTranscriptForTask(brainDir, taskUuid) {
+    if (!brainDir || !fs.existsSync(brainDir)) return null;
+
+    try {
+        const entries = fs.readdirSync(brainDir);
+        const candidates = [];
+
+        for (const d of entries) {
+            const full = path.join(brainDir, d);
+            try {
+                const stat = fs.statSync(full);
+                if (stat.isDirectory()) {
+                    candidates.push({ full, time: Math.max(stat.mtimeMs, stat.ctimeMs || 0) });
+                }
+            } catch (_) {}
+        }
+
+        // Sort newest folders first
+        candidates.sort((a, b) => b.time - a.time);
+
+        // Check top 25 candidates
+        for (const cand of candidates.slice(0, 25)) {
+            const targetLog = path.join(cand.full, '.system_generated', 'logs', 'transcript.jsonl');
+            if (fs.existsSync(targetLog)) {
+                try {
+                    // Check if transcript file contains task.uuid in the first 8KB
+                    const fd = fs.openSync(targetLog, 'r');
+                    const buf = Buffer.alloc(8192);
+                    const bytesRead = fs.readSync(fd, buf, 0, 8192, 0);
+                    fs.closeSync(fd);
+                    const head = buf.toString('utf8', 0, bytesRead);
+                    if (head.includes(taskUuid)) {
+                        return targetLog;
+                    }
+                } catch (_) {}
+            }
+        }
+    } catch (_) {}
+
+    return null;
+}
+
 function executeWithAgyCli(agyCli, task, projectDir, taskSpecFile, promptMessage, beforeGit, serverUrl, token, baseExecutionLogs) {
     return new Promise((resolve) => {
         let executionLogs = baseExecutionLogs + `[Antigravity CLI] Menjalankan perintah agy headless di ${projectDir}...\n`;
@@ -466,6 +508,9 @@ function executeWithAgyCli(agyCli, task, projectDir, taskSpecFile, promptMessage
                 }, { log: text });
             } catch (_) {}
         };
+
+        // Kirim sinyal awal bahwa runner CLI mulai berjalan
+        sendProgress(`[Antigravity CLI] Memulai runner agy di ${projectDir}...\n`);
 
         const args = [
             '-p', promptMessage,
@@ -501,7 +546,9 @@ function executeWithAgyCli(agyCli, task, projectDir, taskSpecFile, promptMessage
             const str = chunk.toString();
             stderrData += str;
             process.stderr.write(str);
-            await sendProgress(str.slice(-200));
+            if (!str.includes('root agent idle') && !str.includes('Warning: Setting the NODE_TLS')) {
+                await sendProgress(`[Stderr] ${str.trim()}\n`);
+            }
         });
 
         // 2. Pantau transcript JSONL dari agy secara realtime (proses berpikir & aksi tool)
@@ -510,32 +557,13 @@ function executeWithAgyCli(agyCli, task, projectDir, taskSpecFile, promptMessage
         let lastLineRead = 0;
 
         const transcriptMonitor = setInterval(async () => {
-            if (!activeTranscriptFile && fs.existsSync(cliBrainDir)) {
-                try {
-                    const entries = fs.readdirSync(cliBrainDir);
-                    const candidates = [];
-                    for (const d of entries) {
-                        const full = path.join(cliBrainDir, d);
-                        try {
-                            const stat = fs.statSync(full);
-                            const t = Math.max(stat.mtimeMs, stat.birthtimeMs || 0);
-                            // Saring folder yang lahir/diubah setelah tugas ini mulai berjalan (buffer 3s)
-                            if (stat.isDirectory() && t >= (taskStartTime - 3000)) {
-                                candidates.push({ full, time: t });
-                            }
-                        } catch (_) {}
-                    }
-
-                    candidates.sort((a, b) => b.time - a.time);
-
-                    if (candidates.length > 0) {
-                        const targetLog = path.join(candidates[0].full, '.system_generated', 'logs', 'transcript.jsonl');
-                        if (fs.existsSync(targetLog)) {
-                            activeTranscriptFile = targetLog;
-                            lastLineRead = 0; // Baca dari awal untuk tugas baru ini
-                        }
-                    }
-                } catch (_) {}
+            if (!activeTranscriptFile) {
+                activeTranscriptFile = findTranscriptForTask(cliBrainDir, task.uuid);
+                if (activeTranscriptFile) {
+                    const convName = path.basename(path.dirname(path.dirname(path.dirname(activeTranscriptFile))));
+                    console.log(`[Antigravity CLI] Terdeteksi transcript aktif: ${convName}`);
+                    await sendProgress(`[Antigravity CLI] Terhubung ke sesi AI (${convName})...\n`);
+                }
             }
 
             if (activeTranscriptFile && fs.existsSync(activeTranscriptFile)) {
@@ -547,6 +575,8 @@ function executeWithAgyCli(agyCli, task, projectDir, taskSpecFile, promptMessage
                             const newEntries = all.slice(lastLineRead);
                             lastLineRead = all.length;
 
+                            let batchProgress = '';
+
                             for (const lineStr of newEntries) {
                                 if (!lineStr || !lineStr.trim()) continue;
                                 try {
@@ -554,7 +584,7 @@ function executeWithAgyCli(agyCli, task, projectDir, taskSpecFile, promptMessage
                                     if (entry.type === 'PLANNER_RESPONSE') {
                                         if (entry.thinking) {
                                             const snippet = entry.thinking.trim().slice(0, 300);
-                                            await sendProgress(`[Berpikir] ${snippet}...\n`);
+                                            batchProgress += `[Berpikir] ${snippet}...\n`;
                                         }
                                         if (Array.isArray(entry.tool_calls) && entry.tool_calls.length) {
                                             const toolNames = entry.tool_calls.map(tc => {
@@ -568,13 +598,17 @@ function executeWithAgyCli(agyCli, task, projectDir, taskSpecFile, promptMessage
                                                 }
                                                 return tc.name;
                                             }).join(', ');
-                                            await sendProgress(`[Aksi Tool] ${toolNames}\n`);
+                                            batchProgress += `[Aksi Tool] ${toolNames}\n`;
                                         }
                                     } else if (entry.content && typeof entry.content === 'string' && entry.content.trim().length > 0 && entry.source === 'MODEL') {
                                         const snippet = entry.content.trim().slice(0, 250);
-                                        await sendProgress(`[AI] ${snippet}\n`);
+                                        batchProgress += `[AI] ${snippet}\n`;
                                     }
                                 } catch (_) {}
+                            }
+
+                            if (batchProgress.trim()) {
+                                await sendProgress(batchProgress);
                             }
                         }
                     }
