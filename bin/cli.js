@@ -1053,6 +1053,62 @@ function setupProjectAndPermissions(cwd, config) {
     return { projectName, projectKey, resolvedPath };
 }
 
+function resolveWorkerIdentity(config, params = {}) {
+    const cliId = params['worker-id'] || params.id;
+    const cliName = params['worker-name'] || params.name;
+
+    // PM2 Environment detection
+    const isPm2 = process.env.pm_id !== undefined || process.env.PM2_HOME !== undefined;
+    const pmId = process.env.pm_id;
+    const pmAppName = process.env.name;
+    const isPm2Numeric = pmId !== undefined && pmId !== '' && !isNaN(parseInt(pmId, 10));
+    const hasCustomPmAppName = isPm2 && pmAppName && !['agy-remote', 'bash', 'sh', 'node', 'app', 'default'].includes(pmAppName.toLowerCase());
+
+    let isCustomName = Boolean(cliName || hasCustomPmAppName || config.workerName);
+    let workerName = cliName
+        ? String(cliName).trim()
+        : (hasCustomPmAppName
+            ? pmAppName.trim()
+            : (config.workerName ? String(config.workerName).trim() : ''));
+
+    if (!workerName) {
+        if (isPm2Numeric && parseInt(pmId, 10) > 0) {
+            workerName = `${os.hostname()} #${parseInt(pmId, 10) + 1} (${os.platform()})`;
+        } else {
+            workerName = `${os.hostname()} (${os.platform()})`;
+        }
+    } else if (isPm2Numeric && parseInt(pmId, 10) > 0 && !workerName.includes('#')) {
+        // Multi-instance cluster in PM2: append instance index
+        workerName = `${workerName} #${parseInt(pmId, 10) + 1}`;
+    }
+
+    let workerId = '';
+    if (cliId) {
+        workerId = String(cliId).trim();
+    } else if (cliName || hasCustomPmAppName) {
+        // Explicit new name on CLI or PM2 app name: generate distinct worker ID
+        const baseHost = os.hostname();
+        const slug = workerName.toLowerCase().replace(/[^a-z0-9_-]/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '');
+        workerId = slug ? `${baseHost}-${slug}` : baseHost;
+    } else if (isPm2Numeric && parseInt(pmId, 10) > 0) {
+        // PM2 secondary cluster/fork instance
+        const baseHost = os.hostname();
+        workerId = `${baseHost}-pm2-${pmId}`;
+    } else if (config.workerId) {
+        workerId = String(config.workerId).trim();
+    } else {
+        const baseHost = os.hostname();
+        if (isCustomName) {
+            const slug = workerName.toLowerCase().replace(/[^a-z0-9_-]/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '');
+            workerId = slug ? `${baseHost}-${slug}` : baseHost;
+        } else {
+            workerId = baseHost;
+        }
+    }
+
+    return { workerId, workerName, isCustomName };
+}
+
 async function startListening(config) {
     const rawServer = config.server || 'https://tools.nusagates.com';
     const serverUrl = rawServer.replace(/\/tasks\/?$/i, '').replace(/\/+$/, '');
@@ -1065,7 +1121,7 @@ async function startListening(config) {
         process.exit(1);
     }
 
-    const isCustomName = Boolean(config.workerName);
+    const isCustomName = Boolean(config.isCustomName);
     const workerId = config.workerId || `${os.hostname()}`;
     const workerName = config.workerName || `${os.hostname()} (${os.platform()})`;
     const platform = os.platform();
@@ -1184,20 +1240,25 @@ async function main() {
     }
     if (parsed.params.token) config.token = parsed.params.token;
     if (parsed.params.interval) config.pollInterval = parseInt(parsed.params.interval, 10);
-    if (parsed.params['worker-id'] || parsed.params.id) {
-        config.workerId = String(parsed.params['worker-id'] || parsed.params.id).replace(/^["']|["']$/g, '');
-    }
-    if (parsed.params['worker-name'] || parsed.params.name) {
-        config.workerName = String(parsed.params['worker-name'] || parsed.params.name).replace(/^["']|["']$/g, '');
-    }
+
+    const identity = resolveWorkerIdentity(config, parsed.params);
+    config.workerId = identity.workerId;
+    config.workerName = identity.workerName;
+    config.isCustomName = identity.isCustomName;
     
     // --once should only apply per invocation, never persisted
     const runOnce = !!parsed.params.once;
     delete config.once;
 
-    // Save updated parameters to persistent config
-    if (parsed.params.server || parsed.params.token || parsed.params['worker-id'] || parsed.params.id || parsed.params['worker-name'] || parsed.params.name) {
-        saveConfig(config);
+    // Save updated general parameters (server/token) to persistent config.
+    // Avoid saving instance-specific worker IDs or names into global config so multi-workers on the same host don't conflict.
+    if (parsed.params.server || parsed.params.token) {
+        const toSave = { ...config };
+        delete toSave.workerId;
+        delete toSave.workerName;
+        delete toSave.isCustomName;
+        delete toSave.once;
+        saveConfig(toSave);
     }
 
     if (runOnce) {
@@ -1241,7 +1302,8 @@ Penggunaan:
 Opsi:
   --server=<url>       URL server ToolBox (contoh: https://toolbox.my.id)
   --token=<token>      Token agen dari halaman Remote Coding ToolBox
-  --name=<nama>        Nama worker / mesin (contoh: VPS-Ubuntu, MacBook-Pro)
+  --name=<nama>        Nama worker / mesin (contoh: VPS-Ubuntu, Worker-1)
+  --id=<id>            ID unik worker (contoh: worker-1, default otomatis dari nama/hostname)
   --interval=<ms>      Interval polling dalam milidetik (default: 5000)
   --add-project=key:path  Petakan proyek baru (contoh: auresys:C:\\laragon\\www\\auresys)
 
