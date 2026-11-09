@@ -465,8 +465,8 @@ function findTranscriptForTask(brainDir, taskUuid) {
         // Sort newest folders first
         candidates.sort((a, b) => b.time - a.time);
 
-        // Check top 50 candidates
-        for (const cand of candidates.slice(0, 50)) {
+        // Check top 100 candidates
+        for (const cand of candidates.slice(0, 100)) {
             const logPaths = [
                 path.join(cand.full, '.system_generated', 'logs', 'transcript.jsonl'),
                 path.join(cand.full, '.system_generated', 'logs', 'chunks', 'transcript', '00000000.jsonl')
@@ -474,10 +474,10 @@ function findTranscriptForTask(brainDir, taskUuid) {
             for (const targetLog of logPaths) {
                 if (fs.existsSync(targetLog)) {
                     try {
-                        // Check if transcript file contains task.uuid in the first 8KB
+                        // Check if transcript file contains task.uuid in the first 64KB
                         const fd = fs.openSync(targetLog, 'r');
-                        const buf = Buffer.alloc(8192);
-                        const bytesRead = fs.readSync(fd, buf, 0, 8192, 0);
+                        const buf = Buffer.alloc(65536);
+                        const bytesRead = fs.readSync(fd, buf, 0, 65536, 0);
                         fs.closeSync(fd);
                         const head = buf.toString('utf8', 0, bytesRead);
                         if (head.includes(taskUuid)) {
@@ -572,11 +572,33 @@ function executeWithAgyCli(agyCli, task, projectDir, taskSpecFile, promptMessage
                 }
             }
 
+            // Upgrade to main transcript.jsonl if active was previously pointing to a chunk
+            if (activeTranscriptFile && !activeTranscriptFile.endsWith('transcript.jsonl')) {
+                const convDir = activeTranscriptFile.includes('.system_generated')
+                    ? activeTranscriptFile.slice(0, activeTranscriptFile.indexOf('.system_generated'))
+                    : null;
+                if (convDir) {
+                    const mainLog = path.join(convDir, '.system_generated', 'logs', 'transcript.jsonl');
+                    if (fs.existsSync(mainLog)) {
+                        activeTranscriptFile = mainLog;
+                    }
+                }
+            }
+
             if (activeTranscriptFile && fs.existsSync(activeTranscriptFile)) {
                 try {
-                    const raw = fs.readFileSync(activeTranscriptFile, 'utf8').trim();
+                    let raw = fs.readFileSync(activeTranscriptFile, 'utf8');
                     if (raw) {
-                        const all = raw.split('\n');
+                        if (!raw.endsWith('\n')) {
+                            const lastNewline = raw.lastIndexOf('\n');
+                            if (lastNewline !== -1) {
+                                raw = raw.slice(0, lastNewline);
+                            } else {
+                                raw = '';
+                            }
+                        }
+
+                        const all = raw ? raw.trim().split('\n') : [];
                         if (all.length > lastLineRead) {
                             const newEntries = all.slice(lastLineRead);
                             lastLineRead = all.length;
@@ -1214,6 +1236,11 @@ async function startListening(config) {
                     'X-Worker-Custom-Name': isCustomName ? '1' : '0',
                 },
             });
+
+            if (res && res.action === 'restart') {
+                console.log('\n[Worker] Menerima instruksi restart dari server. Merestart worker untuk memuat ulang versi terbaru...');
+                process.exit(0);
+            }
 
             if (res && res.task) {
                 isBusy = true;
